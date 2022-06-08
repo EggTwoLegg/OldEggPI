@@ -1,0 +1,529 @@
+using System;
+using BHRPG.Mathematics;
+using BHRPG.System;
+using BHRPG.System.Collision;
+using BHRPG.System.Movement;
+using BHRPG.System.Movement.Humanoid;
+using BHRPG.System.Nav;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
+using Unity.Entities;
+using Unity.Jobs;
+using Unity.Mathematics;
+using Unity.Transforms;
+using UnityEngine;
+
+//====
+namespace BHRPG
+{
+//====
+
+
+[UpdateAfter(typeof(PollInputSystem))]
+public unsafe class BruteforceSweepTestSystem : JobComponentSystem
+{
+	private NativeMultiHashMap<int3, Entity>   spatial_buckets;
+	private NativeMultiHashMap<Entity, Entity> contact_pairs;
+	
+	private EntityArchetypeQuery agent_data_query;
+	private EntityArchetypeQuery colworld_query;
+	
+	[BurstCompile]
+	private struct BucketPartioningJob : IJobProcessComponentDataWithEntity<CMP_NavAgent, Position, CMP_CapsuleShape, CMP_MoveInput>
+	{
+		[ReadOnly]  private CMP_CollisionWorldSettings					world_settings;
+		[WriteOnly] private NativeMultiHashMap<int3, Entity>.Concurrent buckets;
+
+		[ReadOnly]  private float dt;
+		
+		public BucketPartioningJob(CMP_CollisionWorldSettings world_settings, NativeMultiHashMap<int3, Entity>.Concurrent buckets,
+			float dt)
+		{
+			this.world_settings = world_settings;
+			this.buckets 	    = buckets;
+			this.dt = dt;
+		}
+
+		public void 
+		Execute(Entity ent, int index, ref CMP_NavAgent agt, ref Position pos, ref CMP_CapsuleShape cap, ref CMP_MoveInput input)
+		{
+			float3 start_pos = pos.Value - cap.radius;
+			float3 end_pos	 = pos.Value + input.val.xnz() * agt.speed * dt + cap.radius;
+
+			int3 start_clamped = (int3)(start_pos / world_settings.partition_size);
+			int3 end_clamped   = (int3)(end_pos   / world_settings.partition_size);
+
+			int3 min = math.min(start_clamped, end_clamped);
+			int3 max = math.max(start_clamped, end_clamped);
+			
+			for(int y = min.y; y <= max.y; y++)
+			for(int z = min.z; z <= max.z; z++)
+			for(int x = min.x; x <= max.x; x++)
+			{
+				int3 key = new int3(x, y, z);
+				buckets.Add(key, ent);
+			}
+		}
+	}
+	
+	[BurstCompile]
+	private struct GenerateContactPairsJob : IJobProcessComponentDataWithEntity<CMP_NavAgent, Position, CMP_CapsuleShape, CMP_MoveInput>
+	{
+		[ReadOnly, NativeDisableContainerSafetyRestriction] 
+		private NativeMultiHashMap<int3, Entity> buckets;
+		
+		[ReadOnly]  private CMP_CollisionWorldSettings world_settings;
+		[WriteOnly] private NativeMultiHashMap<Entity, Entity>.Concurrent pairs;
+		[ReadOnly]  private float dt;
+		
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_NavAgent>  	 agt;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<Position> 	  	 pos;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_MoveInput> 	 input;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_CapsuleShape> cap;
+		
+		public GenerateContactPairsJob(NativeMultiHashMap<int3, Entity> buckets, CMP_CollisionWorldSettings world_settings, 
+			ComponentDataFromEntity<CMP_NavAgent> agt, ComponentDataFromEntity<Position> pos, ComponentDataFromEntity<CMP_MoveInput> input, 
+			ComponentDataFromEntity<CMP_CapsuleShape> cap, NativeMultiHashMap<Entity, Entity>.Concurrent pairs, float dt)
+		{
+			this.buckets = buckets;
+			this.world_settings = world_settings;
+			this.agt 	 = agt;
+			this.pos 	 = pos;
+			this.input 	 = input;
+			this.cap 	 = cap;
+			this.pairs   = pairs;
+			this.dt		 = dt;
+		}
+		
+		public void 
+		Execute(Entity ent, int index, ref CMP_NavAgent agt, ref Position pos, ref CMP_CapsuleShape cap, ref CMP_MoveInput input)
+		{
+			float3 start_pos = pos.Value - cap.radius;
+			float3 end_pos	 = pos.Value + input.val.xnz() * agt.speed * dt + cap.radius;
+
+			int3 start_clamped = (int3)(start_pos / world_settings.partition_size);
+			int3 end_clamped   = (int3)(end_pos   / world_settings.partition_size);
+
+			int3 min = math.min(start_clamped, end_clamped);
+			int3 max = math.max(start_clamped, end_clamped);
+
+			var my_pos = pos.Value;
+			var my_end = pos.Value + input.val.xnz() * agt.speed * dt + cap.radius;
+			
+			for(int y = min.y; y <= max.y; y++)
+			for(int z = min.z; z <= max.z; z++)
+			for(int x = min.x; x <= max.x; x++)
+			{
+				int3 key = new int3(x, y, z);
+				
+				if(!buckets.TryGetFirstValue(key, out var other_e, out var it)) { continue; } // No ents in current bucket.
+				if(ent == other_e) { continue; } // Don't test against self.
+
+				var other_cap   = this.cap[other_e];
+				var other_pos   = this.pos[other_e].Value;
+				var other_input = this.input[other_e].val.xnz();
+				var other_agt   = this.agt[other_e];
+				var other_end = other_pos + other_input + other_agt.speed * dt + other_cap.radius;
+				
+				// Shitty test to cull collisions easily: Conjugate the position of the other capsule, expand it by its velocity and my cap's
+				// velocity and test square distance <=
+				var expanded_rad = cap.radius + other_cap.radius + math.lengthsq(my_pos - my_end) + math.lengthsq(other_pos - other_end);
+				
+				if(math.lengthsq(my_pos - other_pos) <= expanded_rad) { pairs.Add(ent, other_e); }
+				
+				while(buckets.TryGetNextValue(out other_e, ref it))
+				{
+					other_cap   = this.cap[other_e];
+					other_pos   = this.pos[other_e].Value;
+					other_input = this.input[other_e].val.xnz();
+					other_agt   = this.agt[other_e];
+					other_end = other_pos + other_input + other_agt.speed * dt + other_cap.radius;
+				
+					// Shitty test to cull collisions easily: Conjugate the position of the other capsule, expand it by its velocity and my cap's
+					// velocity and test square distance <=
+					expanded_rad = cap.radius + other_cap.radius + math.lengthsq(my_pos - my_end) + math.lengthsq(other_pos - other_end);
+				
+					if(math.lengthsq(my_pos - other_pos) <= expanded_rad) { pairs.Add(ent, other_e); }
+				}
+			}
+		}
+	}
+	
+	[BurstCompile]
+	private struct SweepContactsJob : IJobProcessComponentDataWithEntity<CMP_NavAgent, Position, CMP_MoveInput, CMP_CapsuleShape>
+	{
+		[ReadOnly, NativeDisableContainerSafetyRestriction] 
+		private NativeMultiHashMap<Entity, Entity> pairs;
+		
+		[WriteOnly] private NativeArray<ConvexCastHit> hit_res;
+		
+		private float dt;
+
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_NavAgent>  	 agt;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<Position> 	  	 pos;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_MoveInput> 	 input;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ComponentDataFromEntity<CMP_CapsuleShape> cap;
+		
+		public SweepContactsJob(ComponentDataFromEntity<CMP_NavAgent> agt, 
+			ComponentDataFromEntity<Position> pos, ComponentDataFromEntity<CMP_MoveInput> input, ComponentDataFromEntity<CMP_CapsuleShape> cap, 
+			NativeMultiHashMap<Entity, Entity> pairs, NativeArray<ConvexCastHit> hit_res, float dt)
+		{
+			this.agt 	 = agt;
+			this.pos 	 = pos;
+			this.input 	 = input;
+			this.cap 	 = cap;
+			this.pairs   = pairs;
+			this.hit_res = hit_res;
+			this.dt		 = dt;
+		}
+
+		public void 
+		Execute(Entity ent, int i_ent, ref CMP_NavAgent my_agt, ref Position my_pos, ref CMP_MoveInput my_input, ref CMP_CapsuleShape my_cap)
+		{
+			if(!pairs.TryGetFirstValue(ent, out var other_e, out var it)) { return; }
+			
+			var closest_hit = new ConvexCastHit(float3.zero, 1f, float3.zero);
+
+			var my_end = my_pos.Value + my_agt.speed * dt * my_input.val.xnz();
+
+			var other_pos = pos[other_e].Value;
+			var other_end = other_pos + agt[other_e].speed * dt * input[other_e].val.xnz();
+			var other_cap = cap[other_e];
+
+			var gjk = new GJK();
+			
+			if(gjk.SweepCapsuleCapsule(ref my_cap, my_pos.Value, my_end, ref other_cap, other_pos, other_end, out var hit))
+			{					
+				if(hit.time < closest_hit.time)
+				{
+					closest_hit = hit;
+				}		
+			}
+			
+			while(pairs.TryGetNextValue(out other_e, ref it))
+			{
+				other_pos = pos[other_e].Value;
+				other_end = other_pos + agt[other_e].speed * dt * input[other_e].val.xnz();
+				other_cap = cap[other_e];
+
+				gjk = new GJK();
+			
+				if(gjk.SweepCapsuleCapsule(ref my_cap, my_pos.Value, my_end, ref other_cap, other_pos, other_end, out hit))
+				{					
+					if(hit.time < closest_hit.time)
+					{
+						closest_hit = hit;
+					}		
+				}
+			}
+			
+			hit_res[i_ent] = closest_hit;
+		}
+	}
+	
+	[BurstCompile]
+	private struct SweepJob : IJobParallelFor
+	{
+		[ReadOnly, DeallocateOnJobCompletion] private NativeArray<ArchetypeChunk> chunks;
+		[ReadOnly] private ArchetypeChunkComponentType<CMP_NavAgent>     agent;
+		[ReadOnly] private ArchetypeChunkComponentType<Position> 	     position;
+		[ReadOnly] private ArchetypeChunkComponentType<CMP_CapsuleShape> capsule;
+		[ReadOnly] private ArchetypeChunkComponentType<CMP_MoveInput>    move_input;
+		[ReadOnly] private ArchetypeChunkEntityType entities;
+
+		[WriteOnly] private NativeHashMap<Entity, ConvexCastHit>.Concurrent hit_res;
+
+		private float dt;
+		
+		public SweepJob(NativeArray<ArchetypeChunk> chunks, ArchetypeChunkEntityType entities, ArchetypeChunkComponentType<CMP_NavAgent> agent, 
+			ArchetypeChunkComponentType<Position> position, ArchetypeChunkComponentType<CMP_CapsuleShape> capsule, 
+			ArchetypeChunkComponentType<CMP_MoveInput> move_input, NativeHashMap<Entity, ConvexCastHit>.Concurrent hit_res, float dt)
+		{
+			this.chunks		= chunks;
+			this.entities   = entities;
+			this.agent      = agent;
+			this.position   = position;
+			this.capsule	= capsule;
+			this.move_input = move_input;
+			this.hit_res 	= hit_res;
+
+			this.dt = dt;
+		}
+		
+		public void 
+		Execute(int i_chunk)
+		{
+			var chunk	   = chunks[i_chunk];
+			var ent_data   = chunk.GetNativeArray(entities);
+			var agent_data = chunk.GetNativeArray(agent);
+			var pos_data   = chunk.GetNativeArray(position);
+			var cap_data   = chunk.GetNativeArray(capsule);
+			var input_data = chunk.GetNativeArray(move_input);
+
+			var num_agents = agent_data.Length;
+			for(int i_agent = 0; i_agent < num_agents; i_agent++) // All agents in input chunk.
+			{
+				var my_ent   = ent_data[i_agent];
+				var my_agt   = agent_data[i_agent];
+				var my_input = input_data[i_agent];
+			
+				if(math.lengthsq(my_input.val) <= GJK.SWEEP_EPSILON) { return; }
+			
+				var my_pos	 = pos_data[i_agent];
+				var my_end	 = my_pos.Value + my_input.val.xnz() * my_agt.speed * dt;
+				var my_cap	 = cap_data[i_agent];
+				var gjk = new GJK();
+
+				var closest_hit = new ConvexCastHit(float3.zero, 1f, float3.zero);
+				
+				var numotherchunks = chunks.Length;
+				for(int i_other_chunk = 0; i_other_chunk < numotherchunks; i_other_chunk++) // Test agent against every other agent in every other chunk.
+				{
+					var o_chunk	   	 = chunks[i_other_chunk];
+					var o_ent_data   = o_chunk.GetNativeArray(entities);
+					var o_agent_data = o_chunk.GetNativeArray(agent);
+					var o_pos_data   = o_chunk.GetNativeArray(position);
+					var o_cap_data   = o_chunk.GetNativeArray(capsule);
+					var o_input_data = o_chunk.GetNativeArray(move_input);
+
+					var numotheragents = o_agent_data.Length;
+					for(int i_other_agent = 0; i_other_agent < numotheragents; i_other_agent++)
+					{
+						var other_ent = o_ent_data[i_other_agent];
+						
+						if(my_ent == other_ent) { continue; }
+
+						var other_agt   = o_agent_data[i_other_agent];
+						var other_pos   = o_pos_data[i_other_agent];
+						var other_input = o_input_data[i_other_agent];
+						var other_end	= other_pos.Value + other_input.val.xnz() * other_agt.speed * dt;
+						var other_cap	= o_cap_data[i_other_agent];
+
+						if(gjk.SweepCapsuleCapsule(ref my_cap, my_pos.Value, my_end, ref other_cap, other_pos.Value, other_end, out var hit))
+						{					
+							if(hit.time < closest_hit.time)
+							{
+								closest_hit = hit;
+							}		
+						}
+					}
+				}
+				
+				hit_res.TryAdd(my_ent, closest_hit);
+			}
+		}
+	}
+	
+	[BurstCompile]
+	private struct SweepJob2 : IJobProcessComponentDataWithEntity<CMP_NavAgent, Position, CMP_CapsuleShape, CMP_MoveInput>
+	{
+		[ReadOnly, DeallocateOnJobCompletion] private NativeArray<ArchetypeChunk> chunks;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ArchetypeChunkComponentType<CMP_NavAgent>     agent;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ArchetypeChunkComponentType<Position> 	      position;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ArchetypeChunkComponentType<CMP_CapsuleShape> capsule;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ArchetypeChunkComponentType<CMP_MoveInput>    move_input;
+		[ReadOnly, NativeDisableContainerSafetyRestriction] private ArchetypeChunkEntityType entities;
+
+		[WriteOnly] private NativeArray<ConvexCastHit> hit_res;
+
+		private float dt;
+		
+		public SweepJob2(NativeArray<ArchetypeChunk> chunks, ArchetypeChunkEntityType entities, ArchetypeChunkComponentType<CMP_NavAgent> agent, 
+			ArchetypeChunkComponentType<Position> position, ArchetypeChunkComponentType<CMP_CapsuleShape> capsule, 
+			ArchetypeChunkComponentType<CMP_MoveInput> move_input, NativeArray<ConvexCastHit> hit_res, float dt)
+		{
+			this.chunks		= chunks;
+			this.entities   = entities;
+			this.agent      = agent;
+			this.position   = position;
+			this.capsule	= capsule;
+			this.move_input = move_input;
+			this.hit_res 	= hit_res;
+
+			this.dt = dt;
+		}
+		
+		public void 
+		Execute(Entity my_ent, int index, ref CMP_NavAgent my_agt, ref Position my_pos, ref CMP_CapsuleShape my_cap, ref CMP_MoveInput my_input)
+		{
+			var my_end	 = my_pos.Value + my_input.val.xnz() * my_agt.speed * dt;
+			var gjk = new GJK();
+
+			var closest_hit = new ConvexCastHit(float3.zero, 1f, float3.zero);
+			
+			for(int i_chunk = 0; i_chunk < chunks.Length; i_chunk++)
+			{
+				var chunk	   = chunks[i_chunk];
+				var ent_data   = chunk.GetNativeArray(entities);
+				var agent_data = chunk.GetNativeArray(agent);
+				var pos_data   = chunk.GetNativeArray(position);
+				var cap_data   = chunk.GetNativeArray(capsule);
+				var input_data = chunk.GetNativeArray(move_input);
+
+				int num_ents_chunk = ent_data.Length;
+				for(int i_entity = 0; i_entity < num_ents_chunk; i_entity++)
+				{
+					var other_ent = ent_data[i_entity];
+							
+					if(my_ent == other_ent) { continue; }
+		
+					var other_agt   = agent_data[i_entity];
+					var other_pos   = pos_data[i_entity];
+					var other_input = input_data[i_entity];
+					var other_end	= other_pos.Value + other_input.val.xnz() * other_agt.speed * dt;
+					var other_cap	= cap_data[i_entity];
+					
+					// Shitty test to cull collisions easily: Conjugate the position of the other capsule, expand it by its velocity and my cap's
+					// velocity and test square distance <=
+					var expanded_rad = my_cap.radius + other_cap.radius + math.lengthsq(my_pos.Value - my_end) + 
+									   math.lengthsq(other_pos.Value - other_end);
+					
+					if(math.lengthsq(my_pos.Value - other_pos.Value) > expanded_rad) { continue; }
+		
+					if(gjk.SweepCapsuleCapsule(ref my_cap, my_pos.Value, my_end, ref other_cap, other_pos.Value, other_end, out var hit))
+					{					
+						if(hit.time < closest_hit.time)
+						{
+							closest_hit = hit;
+						}		
+					}
+				}
+			}
+
+			hit_res[index] = closest_hit;
+		}
+	}
+	
+	[BurstCompile]
+	private struct MoveJob : IJobProcessComponentDataWithEntity<CMP_MoveInput, Position, CMP_NavAgent, CMP_CapsuleShape>
+	{
+		[ReadOnly, DeallocateOnJobCompletion] 
+		private NativeArray<ConvexCastHit> hits;
+		
+		private float dt;
+		
+		public MoveJob(NativeArray<ConvexCastHit> hits, float dt)
+		{
+			this.hits = hits;
+			this.dt	  = dt;
+		}
+		
+		public void 
+		Execute(Entity ent, int i_ent, ref CMP_MoveInput input, ref Position pos, ref CMP_NavAgent agt, ref CMP_CapsuleShape cap)
+		{
+			if(math.lengthsq(input.val) < GJK.SWEEP_EPSILON) { return; }
+
+			var hit = hits[i_ent];
+			
+			// Take move input, "step back" by the closest hit position + the normal at the position multiplied by an epsilon.
+			float3 final_pos = pos.Value + (input.val.xnz() * agt.speed * dt * hit.time) + hit.norm * hit.pen_amt;
+		
+			final_pos = math.clamp(final_pos, new float3(-40f, 0f, -40f), new float3(40f, 10f, 40f));
+
+			pos.Value = final_pos;
+		}
+	}
+
+	protected override void 
+	OnCreateManager()
+	{
+		agent_data_query = new EntityArchetypeQuery()
+		{
+			None = Array.Empty<ComponentType>(),
+			Any = Array.Empty<ComponentType>(),
+			All = new[] 
+			{ 
+				typeof(CMP_NavAgent), typeof(Position), typeof(CMP_CapsuleShape), typeof(CMP_MoveInput), ComponentType.Create<CFLAG_NavAgent>() 
+			}
+		};
+
+		colworld_query = new EntityArchetypeQuery()
+		{
+			None = Array.Empty<ComponentType>(),
+			Any  = Array.Empty<ComponentType>(),
+			All  = new[]
+			{
+				ComponentType.Create<CMP_CollisionWorldSettings>()
+			}
+		};
+		
+		spatial_buckets = new NativeMultiHashMap<int3,   Entity>(1_000, Allocator.Persistent);
+		contact_pairs   = new NativeMultiHashMap<Entity, Entity>(256_0000, Allocator.Persistent);
+	}
+
+	protected override JobHandle 
+	OnUpdate(JobHandle input_deps)
+	{
+//		var colchunks = EntityManager.CreateArchetypeChunkArray(colworld_query, Allocator.TempJob);
+//		if(colchunks.Length < 1)
+//		{
+//			colchunks.Dispose();
+//			return input_deps;
+//		}
+		
+		contact_pairs.Clear();
+		spatial_buckets.Clear();
+		
+//		var world_settings = colchunks[0].GetNativeArray(EntityManager.GetArchetypeChunkComponentType<CMP_CollisionWorldSettings>(true))[0];
+//		
+//		colchunks.Dispose();
+		
+		var world_settings = new CMP_CollisionWorldSettings(float3.zero, float3.zero, 10f);
+		
+//		var chunks = EntityManager.CreateArchetypeChunkArray(agent_data_query, Allocator.TempJob);
+//		var ents   = EntityManager.GetArchetypeChunkEntityType();
+//		var agents = EntityManager.GetArchetypeChunkComponentType<CMP_NavAgent>(true);
+//		var pos	   = EntityManager.GetArchetypeChunkComponentType<Position>(true);
+//		var cap	   = EntityManager.GetArchetypeChunkComponentType<CMP_CapsuleShape>(true);
+//		var input  = EntityManager.GetArchetypeChunkComponentType<CMP_MoveInput>(true);
+//		var num_e  = ArchetypeChunkArray.CalculateEntityCount(chunks);
+//		
+//		var hits = new NativeArray<ConvexCastHit>(num_e, Allocator.TempJob);
+//
+//		float dt = Time.deltaTime;
+//		
+//		var sweep_job = new SweepJob2(chunks, ents, agents, pos, cap, input, hits, dt);
+//		var sweep_job_handle = sweep_job.Schedule(this, input_deps);
+//		var movejob   = new MoveJob(hits, dt);
+		
+		
+
+		var agt_data   = EntityManager.GetComponentDataFromEntity<CMP_NavAgent>();
+		var pos_data   = EntityManager.GetComponentDataFromEntity<Position>();
+		var input_data = EntityManager.GetComponentDataFromEntity<CMP_MoveInput>();
+		var cap_data   = EntityManager.GetComponentDataFromEntity<CMP_CapsuleShape>();
+		
+		var chunks = EntityManager.CreateArchetypeChunkArray(agent_data_query, Allocator.TempJob);
+		var num_e  = ArchetypeChunkArray.CalculateEntityCount(chunks);
+		chunks.Dispose();
+
+		var hits = new NativeArray<ConvexCastHit>(num_e, Allocator.TempJob);
+
+		float dt = Time.deltaTime;
+		
+		var cull_job  = new BucketPartioningJob(world_settings, spatial_buckets.ToConcurrent(), dt);
+		var pair_job  = new GenerateContactPairsJob(spatial_buckets, world_settings, agt_data, pos_data, input_data, cap_data,
+			contact_pairs.ToConcurrent(), dt);
+		var sweep_job = new SweepContactsJob(agt_data, pos_data, input_data, cap_data, contact_pairs, hits, dt);
+		var movejob   = new MoveJob(hits, dt);
+
+		var cull_job_handle  = cull_job.Schedule(this, input_deps);
+		var pair_job_handle  = pair_job.Schedule(this, cull_job_handle);
+		var sweep_job_handle = sweep_job.Schedule(this, pair_job_handle);
+
+		return movejob.Schedule(this, sweep_job_handle);
+	}
+
+	protected override void 
+	OnDestroyManager()
+	{
+		spatial_buckets.Dispose();
+		contact_pairs.Dispose();
+	}
+}
+
+
+//====
+}
+//====
